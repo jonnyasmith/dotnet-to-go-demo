@@ -32,16 +32,16 @@ func produce(out chan<- []byte, count int, interval time.Duration) {
 // randomPayload returns either a heartbeat or a job envelope, chosen at random.
 func randomPayload(seq int) []byte {
 	if rand.IntN(2) == 0 {
-		return []byte(fmt.Sprintf(
+		return fmt.Appendf(nil,
 			`{"eventType":%q,"timestamp":%q}`,
 			eventHeartbeat, time.Now().UTC().Format(time.RFC3339),
-		))
+		)
 	}
 
-	return []byte(fmt.Sprintf(
+	return fmt.Appendf(nil,
 		`{"eventType":%q,"eventId":%q,"payload":{"taskName":%q}}`,
 		eventJob,
 		fmt.Sprintf("evt-%04d-%08x", seq, rand.Uint32()),
 		taskNames[rand.IntN(len(taskNames))],
-	))
+	)
 }
