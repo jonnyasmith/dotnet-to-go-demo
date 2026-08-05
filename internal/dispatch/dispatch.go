@@ -18,6 +18,14 @@ import (
 // Handler processes one raw message.
 type Handler func(ctx context.Context, rawJSON []byte) error
 
+// Delivery is one broker message and the acknowledgement operations that
+// decide whether the broker removes, dead-letters, or redelivers it.
+type Delivery interface {
+	Body() []byte
+	Ack() error
+	Nack(requeue bool) error
+}
+
 // ErrNoDiscriminator reports a message that cannot be routed at all.
 var ErrNoDiscriminator = errors.New("message carries no eventType discriminator")
 
@@ -62,8 +70,7 @@ func Retryable(err error) bool {
 	}
 }
 
-// Config tunes the worker pool. The zero value runs one worker with no retries
-// and discards dead letters.
+// Config tunes the worker pool. The zero value runs one worker with no retries.
 type Config struct {
 	// Workers is the number of goroutines draining the queue.
 	Workers int
@@ -71,10 +78,6 @@ type Config struct {
 	Retries int
 	// Backoff is the delay before the second attempt; it doubles thereafter.
 	Backoff time.Duration
-	// DeadLetter receives messages that could not be handled. It must be
-	// drained, or workers block once its buffer fills. A nil channel means
-	// exhausted messages are logged and dropped.
-	DeadLetter chan<- []byte
 }
 
 // Router owns the routing registry and the worker pool.
@@ -118,7 +121,7 @@ func (r *Router) Handle(ctx context.Context, rawJSON []byte) error {
 // Run launches the pool and blocks until the queue is closed and drained, or
 // until ctx is cancelled. Cancellation abandons queued messages; closing the
 // queue drains them.
-func (r *Router) Run(ctx context.Context, queue <-chan []byte) {
+func (r *Router) Run(ctx context.Context, queue <-chan Delivery) {
 	var wg sync.WaitGroup
 
 	for id := range r.cfg.Workers {
@@ -132,18 +135,18 @@ func (r *Router) Run(ctx context.Context, queue <-chan []byte) {
 	wg.Wait()
 }
 
-func (r *Router) work(ctx context.Context, id int, queue <-chan []byte) {
+func (r *Router) work(ctx context.Context, id int, queue <-chan Delivery) {
 	for {
 		select {
 		case <-ctx.Done():
 			r.log.Debug("cancelled, worker shutting down", "worker", id)
 			return
-		case payload, open := <-queue:
+		case delivery, open := <-queue:
 			if !open {
 				r.log.Debug("queue closed, worker shutting down", "worker", id)
 				return
 			}
-			r.deliver(ctx, id, payload)
+			r.deliver(ctx, id, delivery)
 		}
 	}
 }
@@ -151,25 +154,34 @@ func (r *Router) work(ctx context.Context, id int, queue <-chan []byte) {
 // deliver attempts one message, retrying transient failures with exponential
 // backoff before dead-lettering it. A message interrupted by cancellation is
 // abandoned rather than dead-lettered: it was never judged on its own merits.
-func (r *Router) deliver(ctx context.Context, id int, payload []byte) {
+func (r *Router) deliver(ctx context.Context, id int, delivery Delivery) {
 	var err error
+	payload := delivery.Body()
+
+	if ctx.Err() != nil {
+		r.nack(id, delivery, true, ctx.Err())
+		return
+	}
 
 	for attempt := range r.cfg.Retries + 1 {
 		if attempt > 0 {
 			r.log.Warn("retrying message", "worker", id, "attempt", attempt+1, "error", err)
 			if !sleep(ctx, r.cfg.Backoff<<(attempt-1)) {
+				r.nack(id, delivery, true, ctx.Err())
 				return
 			}
 		}
 
 		if err = r.Handle(ctx, payload); err == nil {
+			// Job handlers return only after the store has committed, so this is
+			// deliberately an acknowledgement-after-commit boundary.
+			if ackErr := delivery.Ack(); ackErr != nil {
+				r.log.Error("acknowledging message", "worker", id, "error", ackErr)
+			}
 			return
 		}
 		if ctx.Err() != nil {
-			// Shutdown, not poison: the handler failed because the pipeline is
-			// stopping. Dead-lettering here would file a perfectly good message
-			// as unprocessable and log an error for what is a clean exit.
-			r.log.Debug("message abandoned mid-flight", "worker", id, "error", err)
+			r.nack(id, delivery, true, err)
 			return
 		}
 		if !Retryable(err) {
@@ -178,16 +190,13 @@ func (r *Router) deliver(ctx context.Context, id int, payload []byte) {
 	}
 
 	r.log.Error("message dead-lettered", "worker", id, "error", err)
-	r.deadLetter(ctx, payload)
+	r.nack(id, delivery, false, err)
 }
 
-func (r *Router) deadLetter(ctx context.Context, payload []byte) {
-	if r.cfg.DeadLetter == nil {
-		return
-	}
-	select {
-	case r.cfg.DeadLetter <- payload:
-	case <-ctx.Done():
+func (r *Router) nack(id int, delivery Delivery, requeue bool, cause error) {
+	if err := delivery.Nack(requeue); err != nil {
+		r.log.Error("negative-acknowledging message", "worker", id, "requeue", requeue,
+			"cause", cause, "error", err)
 	}
 }
 

@@ -8,11 +8,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # go-sqlite3 is a cgo package, so the build needs a C compiler.
-      # ubuntu-latest already ships gcc, so no toolchain setup step is needed.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.24.x'
           cache: true
 
       - run: go build ./...

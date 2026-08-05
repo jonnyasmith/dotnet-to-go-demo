@@ -43,7 +43,7 @@ func failIfCalled(t *testing.T) Handler {
 // runAsync starts the pool on its own goroutine so the caller can put a
 // deadline on Run returning; a router that missed a closed queue or a cancelled
 // context would otherwise hang until the whole package times out.
-func runAsync(ctx context.Context, r *Router, queue <-chan []byte) <-chan struct{} {
+func runAsync(ctx context.Context, r *Router, queue <-chan Delivery) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -61,14 +61,91 @@ func awaitRun(t *testing.T, done <-chan struct{}, within time.Duration) {
 	}
 }
 
-func awaitDeadLetter(t *testing.T, dead <-chan []byte, within time.Duration) []byte {
-	t.Helper()
-	select {
-	case payload := <-dead:
-		return payload
-	case <-time.After(within):
-		t.Fatalf("no dead letter arrived within %s", within)
+type recordingDelivery struct {
+	payload []byte
+	acked   bool
+	nacked  bool
+	requeue bool
+}
+
+func (d *recordingDelivery) Body() []byte { return d.payload }
+func (d *recordingDelivery) Ack() error {
+	d.acked = true
+	return nil
+}
+func (d *recordingDelivery) Nack(requeue bool) error {
+	d.nacked = true
+	d.requeue = requeue
+	return nil
+}
+
+func delivery(payload string) *recordingDelivery {
+	return &recordingDelivery{payload: []byte(payload)}
+}
+
+func TestRunAcknowledgesOnlyAfterHandlerSucceeds(t *testing.T) {
+	t.Parallel()
+
+	msg := delivery(jobMsg)
+	var ackedDuringHandler bool
+	r := New(discardLogger(), Config{Workers: 1})
+	r.Register("TransientJob", func(context.Context, []byte) error {
+		ackedDuringHandler = msg.acked
 		return nil
+	})
+
+	queue := make(chan Delivery, 1)
+	queue <- msg
+	close(queue)
+	awaitRun(t, runAsync(context.Background(), r, queue), time.Second)
+
+	if ackedDuringHandler {
+		t.Error("delivery was acknowledged before its handler completed")
+	}
+	if !msg.acked || msg.nacked {
+		t.Errorf("delivery outcome = acked %t, nacked %t; want acknowledged only", msg.acked, msg.nacked)
+	}
+}
+
+func TestRunNacksPermanentFailureWithoutRequeue(t *testing.T) {
+	t.Parallel()
+
+	msg := delivery(jobMsg)
+	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Minute})
+	r.Register("TransientJob", func(context.Context, []byte) error { return Permanent(errHandler) })
+
+	queue := make(chan Delivery, 1)
+	queue <- msg
+	close(queue)
+	awaitRun(t, runAsync(context.Background(), r, queue), time.Second)
+
+	if msg.acked || !msg.nacked || msg.requeue {
+		t.Errorf("delivery outcome = acked %t, nacked %t, requeue %t; want nack without requeue", msg.acked, msg.nacked, msg.requeue)
+	}
+}
+
+func TestRunNacksCancelledInFlightDeliveryWithRequeue(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	msg := delivery(jobMsg)
+	entered := make(chan struct{})
+	r := New(discardLogger(), Config{Workers: 1})
+	r.Register("TransientJob", func(ctx context.Context, _ []byte) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	queue := make(chan Delivery, 1)
+	queue <- msg
+	done := runAsync(ctx, r, queue)
+	<-entered
+	cancel()
+	awaitRun(t, done, time.Second)
+
+	if msg.acked || !msg.nacked || !msg.requeue {
+		t.Errorf("delivery outcome = acked %t, nacked %t, requeue %t; want nack with requeue", msg.acked, msg.nacked, msg.requeue)
 	}
 }
 
@@ -208,9 +285,9 @@ func TestRunDrainsQueueAcrossWorkers(t *testing.T) {
 		return nil
 	})
 
-	queue := make(chan []byte, messages)
+	queue := make(chan Delivery, messages)
 	for range messages {
-		queue <- []byte(heartbeatMsg)
+		queue <- delivery(heartbeatMsg)
 	}
 	close(queue)
 
@@ -227,8 +304,7 @@ func TestRunContinuesAfterFailures(t *testing.T) {
 	t.Parallel()
 
 	var handled atomic.Int64
-	dead := make(chan []byte, 4)
-	r := New(discardLogger(), Config{Workers: 1, DeadLetter: dead})
+	r := New(discardLogger(), Config{Workers: 1})
 	r.Register("SystemHeartbeat", func(context.Context, []byte) error {
 		handled.Add(1)
 		return nil
@@ -239,11 +315,13 @@ func TestRunContinuesAfterFailures(t *testing.T) {
 
 	// One worker, so the two poison messages sit strictly between the two
 	// heartbeats: the second heartbeat only lands if the pool survived them.
-	queue := make(chan []byte, 4)
-	queue <- []byte(heartbeatMsg)
-	queue <- []byte(jobMsg)
-	queue <- []byte(unroutableMsg)
-	queue <- []byte(heartbeatMsg)
+	queue := make(chan Delivery, 4)
+	queue <- delivery(heartbeatMsg)
+	failed := delivery(jobMsg)
+	queue <- failed
+	unroutable := delivery(unroutableMsg)
+	queue <- unroutable
+	queue <- delivery(heartbeatMsg)
 	close(queue)
 
 	awaitRun(t, runAsync(context.Background(), r, queue), 5*time.Second)
@@ -251,8 +329,8 @@ func TestRunContinuesAfterFailures(t *testing.T) {
 	if got := handled.Load(); got != 2 {
 		t.Errorf("handled %d heartbeats, want 2", got)
 	}
-	if got := len(dead); got != 2 {
-		t.Errorf("dead-lettered %d messages, want 2", got)
+	if !failed.nacked || failed.requeue || !unroutable.nacked || unroutable.requeue {
+		t.Error("failed deliveries were not nacked without requeue")
 	}
 }
 
@@ -262,8 +340,7 @@ func TestRunRetriesUntilSuccess(t *testing.T) {
 	const backoff = 2 * time.Millisecond
 
 	var attempts atomic.Int64
-	dead := make(chan []byte, 1)
-	r := New(discardLogger(), Config{Workers: 1, Retries: 2, Backoff: backoff, DeadLetter: dead})
+	r := New(discardLogger(), Config{Workers: 1, Retries: 2, Backoff: backoff})
 	r.Register("TransientJob", func(context.Context, []byte) error {
 		if attempts.Add(1) < 3 {
 			return errHandler
@@ -271,8 +348,9 @@ func TestRunRetriesUntilSuccess(t *testing.T) {
 		return nil
 	})
 
-	queue := make(chan []byte, 1)
-	queue <- []byte(jobMsg)
+	msg := delivery(jobMsg)
+	queue := make(chan Delivery, 1)
+	queue <- msg
 	close(queue)
 
 	start := time.Now()
@@ -282,8 +360,8 @@ func TestRunRetriesUntilSuccess(t *testing.T) {
 	if got := attempts.Load(); got != 3 {
 		t.Errorf("handler ran %d times, want 3 (first attempt plus Retries=2)", got)
 	}
-	if got := len(dead); got != 0 {
-		t.Errorf("dead-lettered %d messages, want 0 once the message eventually succeeded", got)
+	if !msg.acked || msg.nacked {
+		t.Errorf("delivery outcome = acked %t, nacked %t; want acknowledged", msg.acked, msg.nacked)
 	}
 	// The delay doubles, so the two retries wait backoff + 2*backoff. A
 	// constant backoff would come in under this floor; timers never fire early,
@@ -297,15 +375,15 @@ func TestRunDeadLettersAfterRetryExhaustion(t *testing.T) {
 	t.Parallel()
 
 	var attempts atomic.Int64
-	dead := make(chan []byte, 4)
-	r := New(discardLogger(), Config{Workers: 1, Retries: 2, Backoff: time.Millisecond, DeadLetter: dead})
+	r := New(discardLogger(), Config{Workers: 1, Retries: 2, Backoff: time.Millisecond})
 	r.Register("TransientJob", func(context.Context, []byte) error {
 		attempts.Add(1)
 		return errHandler
 	})
 
-	queue := make(chan []byte, 1)
-	queue <- []byte(jobMsg)
+	msg := delivery(jobMsg)
+	queue := make(chan Delivery, 1)
+	queue <- msg
 	close(queue)
 
 	awaitRun(t, runAsync(context.Background(), r, queue), 5*time.Second)
@@ -313,11 +391,8 @@ func TestRunDeadLettersAfterRetryExhaustion(t *testing.T) {
 	if got := attempts.Load(); got != 3 {
 		t.Errorf("handler ran %d times, want 3 (first attempt plus Retries=2)", got)
 	}
-	if got := awaitDeadLetter(t, dead, time.Second); !bytes.Equal(got, []byte(jobMsg)) {
-		t.Errorf("dead letter = %q, want %q", got, jobMsg)
-	}
-	if extra := len(dead); extra != 0 {
-		t.Errorf("%d further dead letters queued, want the payload sent exactly once", extra)
+	if msg.acked || !msg.nacked || msg.requeue {
+		t.Errorf("delivery outcome = acked %t, nacked %t, requeue %t; want nack without requeue", msg.acked, msg.nacked, msg.requeue)
 	}
 }
 
@@ -325,17 +400,17 @@ func TestRunDoesNotRetryPermanentErrors(t *testing.T) {
 	t.Parallel()
 
 	var attempts atomic.Int64
-	dead := make(chan []byte, 2)
 	// A backoff far longer than the deadline below: any retry at all overruns
 	// the guard, so "not retried" is asserted without the test sleeping.
-	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Minute, DeadLetter: dead})
+	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Minute})
 	r.Register("TransientJob", func(context.Context, []byte) error {
 		attempts.Add(1)
 		return Permanent(errHandler)
 	})
 
-	queue := make(chan []byte, 1)
-	queue <- []byte(jobMsg)
+	msg := delivery(jobMsg)
+	queue := make(chan Delivery, 1)
+	queue <- msg
 	close(queue)
 
 	awaitRun(t, runAsync(context.Background(), r, queue), 2*time.Second)
@@ -343,34 +418,28 @@ func TestRunDoesNotRetryPermanentErrors(t *testing.T) {
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("handler ran %d times, want 1: a permanent error is not retried", got)
 	}
-	if got := awaitDeadLetter(t, dead, time.Second); !bytes.Equal(got, []byte(jobMsg)) {
-		t.Errorf("dead letter = %q, want %q", got, jobMsg)
-	}
-	if extra := len(dead); extra != 0 {
-		t.Errorf("%d further dead letters queued, want the payload sent exactly once", extra)
+	if msg.acked || !msg.nacked || msg.requeue {
+		t.Errorf("delivery outcome = acked %t, nacked %t, requeue %t; want nack without requeue", msg.acked, msg.nacked, msg.requeue)
 	}
 }
 
 func TestRunDeadLettersUnroutableWithoutRetrying(t *testing.T) {
 	t.Parallel()
 
-	dead := make(chan []byte, 2)
 	// Same trick as the permanent-error case: the minute-long backoff turns any
 	// retry into a blown deadline.
-	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Minute, DeadLetter: dead})
+	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Minute})
 	r.Register("SystemHeartbeat", failIfCalled(t))
 
-	queue := make(chan []byte, 1)
-	queue <- []byte(unroutableMsg)
+	msg := delivery(unroutableMsg)
+	queue := make(chan Delivery, 1)
+	queue <- msg
 	close(queue)
 
 	awaitRun(t, runAsync(context.Background(), r, queue), 2*time.Second)
 
-	if got := awaitDeadLetter(t, dead, time.Second); !bytes.Equal(got, []byte(unroutableMsg)) {
-		t.Errorf("dead letter = %q, want %q", got, unroutableMsg)
-	}
-	if extra := len(dead); extra != 0 {
-		t.Errorf("%d further dead letters queued, want the payload sent exactly once", extra)
+	if msg.acked || !msg.nacked || msg.requeue {
+		t.Errorf("delivery outcome = acked %t, nacked %t, requeue %t; want nack without requeue", msg.acked, msg.nacked, msg.requeue)
 	}
 }
 
@@ -399,9 +468,9 @@ func TestRunStopsOnCancellation(t *testing.T) {
 		return nil
 	})
 
-	queue := make(chan []byte, backlog)
+	queue := make(chan Delivery, backlog)
 	for range backlog {
-		queue <- []byte(heartbeatMsg)
+		queue <- delivery(heartbeatMsg)
 	}
 	// The queue is deliberately never closed: only cancellation can end this Run.
 	done := runAsync(ctx, r, queue)
@@ -426,9 +495,8 @@ func TestRunAbandonsInFlightMessagesWithoutDeadLettering(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	dead := make(chan []byte, 4)
 	entered := make(chan struct{})
-	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Millisecond, DeadLetter: dead})
+	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Millisecond})
 	r.Register("TransientJob", func(ctx context.Context, _ []byte) error {
 		close(entered)
 		<-ctx.Done()
@@ -437,8 +505,9 @@ func TestRunAbandonsInFlightMessagesWithoutDeadLettering(t *testing.T) {
 		return fmt.Errorf("persisting job: %w", ctx.Err())
 	})
 
-	queue := make(chan []byte, 1)
-	queue <- []byte(jobMsg)
+	msg := delivery(jobMsg)
+	queue := make(chan Delivery, 1)
+	queue <- msg
 	close(queue)
 
 	done := runAsync(ctx, r, queue)
@@ -448,8 +517,8 @@ func TestRunAbandonsInFlightMessagesWithoutDeadLettering(t *testing.T) {
 
 	// Cancellation is not poison. Dead-lettering here would file a perfectly
 	// good message as unprocessable and log an error for a clean shutdown.
-	if got := len(dead); got != 0 {
-		t.Errorf("dead-lettered %d messages on cancellation, want 0", got)
+	if !msg.nacked || !msg.requeue {
+		t.Errorf("delivery outcome = nacked %t, requeue %t; want nack with requeue", msg.nacked, msg.requeue)
 	}
 }
 

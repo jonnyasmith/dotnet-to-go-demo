@@ -1,4 +1,4 @@
-// Package store owns the SQLite database: the schema, the connection pool and
+// Package store owns the Postgres database: the schema, the connection pool and
 // the single writer goroutine that every insert funnels through.
 package store
 
@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	// Registers the "sqlite3" driver with database/sql.
-	_ "github.com/mattn/go-sqlite3"
+	// Registers the "pgx" driver with database/sql.
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // Job is one row of transient_jobs. The db tags let sqlx bind the struct
@@ -22,10 +22,10 @@ type Job struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS transient_jobs (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	id         BIGSERIAL PRIMARY KEY,
 	event_id   TEXT     NOT NULL UNIQUE,
 	task_name  TEXT     NOT NULL,
-	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `
 
@@ -58,20 +58,16 @@ type Store struct {
 	writes chan writeRequest
 }
 
-// Open connects to the SQLite file and ensures the schema exists.
-//
-// SQLite permits one writer at a time. Rather than let workers contend for the
-// lock, the pool is pinned to a single connection and all writes are funnelled
-// through RunWriter; the busy timeout remains as a backstop for other
-// processes touching the same file.
-func Open(path string) (*Store, error) {
-	db, err := sqlx.Connect("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
+// Open connects to Postgres and ensures the schema exists.
+func Open(ctx context.Context, databaseURL string) (*Store, error) {
+	db, err := sqlx.ConnectContext(ctx, "pgx", databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to %s: %w", path, err)
+		return nil, fmt.Errorf("connecting to Postgres: %w", err)
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.ExecContext(ctx, schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialising schema: %w", err)
 	}
@@ -181,7 +177,7 @@ func (s *Store) writeBatch(ctx context.Context, batch []writeRequest) error {
 //
 // It takes primitives and maps them onto Job here so that callers need no type
 // from this package: internal/jobs declares the interface this satisfies, and
-// its handlers stay free of anything SQLite.
+// its handlers stay free of anything Postgres-specific.
 func (s *Store) InsertJob(ctx context.Context, eventID, taskName string) error {
 	ack := make(chan error, 1)
 	req := writeRequest{job: Job{EventID: eventID, TaskName: taskName}, ack: ack}
