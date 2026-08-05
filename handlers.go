@@ -38,9 +38,11 @@ func newJobHandler(log *slog.Logger) Handler {
 				job.EventID, job.Payload.TaskName)
 		}
 
+		// created_at is omitted: the column's DEFAULT CURRENT_TIMESTAMP owns it,
+		// so the timestamp cannot drift between this statement and the schema.
 		const insert = `
-			INSERT INTO transient_jobs (event_id, task_name, created_at)
-			VALUES (:event_id, :task_name, CURRENT_TIMESTAMP)`
+			INSERT INTO transient_jobs (event_id, task_name)
+			VALUES (:event_id, :task_name)`
 
 		args := map[string]any{
 			"event_id":  job.EventID,

@@ -23,7 +23,6 @@ var taskNames = []string{
 type Producer struct {
 	rng      *rand.Rand
 	interval time.Duration
-	now      func() time.Time
 }
 
 // NewProducer builds a producer with a fixed seed and message spacing.
@@ -31,7 +30,6 @@ func NewProducer(seed uint64, interval time.Duration) *Producer {
 	return &Producer{
 		rng:      rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
 		interval: interval,
-		now:      time.Now,
 	}
 }
 
@@ -53,7 +51,7 @@ func (p *Producer) payload(seq int) []byte {
 	if p.rng.IntN(2) == 0 {
 		return fmt.Appendf(nil,
 			`{"eventType":%q,"timestamp":%q}`,
-			eventHeartbeat, p.now().UTC().Format(time.RFC3339),
+			eventHeartbeat, time.Now().UTC().Format(time.RFC3339),
 		)
 	}
 

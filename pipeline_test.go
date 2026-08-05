@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -78,10 +79,6 @@ func expectedJobs(t *testing.T, seed uint64, messages int) (int, []string) {
 	}
 
 	// ORDER BY event_id, because workers race and insertion order is undefined.
-	for i := 1; i < len(ids); i++ {
-		for j := i; j > 0 && ids[j] < ids[j-1]; j-- {
-			ids[j], ids[j-1] = ids[j-1], ids[j]
-		}
-	}
+	slices.Sort(ids)
 	return len(ids), ids
 }
