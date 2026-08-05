@@ -1,8 +1,9 @@
 package main
 
 import (
-	"log"
-	"sync"
+	"log/slog"
+	"math/rand/v2"
+	"os"
 	"time"
 )
 
@@ -15,30 +16,28 @@ const (
 )
 
 func main() {
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	db, err := initialiseDatabase(databasePath)
 	if err != nil {
 		// A database that will not open is a fatal startup condition.
-		log.Fatalf("fatal: %v", err)
+		log.Error("fatal: cannot initialise database", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
 	queue := make(chan []byte, queueDepth)
+	producer := NewProducer(rand.Uint64(), messageSpacing)
+	go producer.Run(queue, messageCount)
 
-	var wg sync.WaitGroup
-	startWorkers(workerCount, db, queue, &wg)
-
-	go produce(queue, messageCount, messageSpacing)
-
-	// produce closes the queue once drained, so this returns only after every
-	// worker has finished its in-flight message.
-	wg.Wait()
+	// Run blocks until the producer closes the queue and every worker has
+	// finished its in-flight message.
+	NewProcessor(db, log).Run(queue, workerCount)
 
 	var jobs int
 	if err := db.Get(&jobs, "SELECT COUNT(*) FROM transient_jobs"); err != nil {
-		log.Printf("could not summarise persisted jobs: %v", err)
+		log.Error("could not summarise persisted jobs", "error", err)
 		return
 	}
-	log.Printf("shutdown complete: %d job(s) persisted in %s", jobs, databasePath)
+	log.Info("shutdown complete", "jobsPersisted", jobs, "database", databasePath)
 }
