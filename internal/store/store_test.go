@@ -84,7 +84,7 @@ func insertJobs(t *testing.T, s *Store, jobs ...Job) {
 	t.Helper()
 
 	for _, job := range jobs {
-		if err := s.InsertJob(t.Context(), job); err != nil {
+		if err := s.InsertJob(t.Context(), job.EventID, job.TaskName); err != nil {
 			t.Fatalf("InsertJob(%+v) returned error: %v", job, err)
 		}
 	}
@@ -210,7 +210,7 @@ func TestInsertJobBatchesConcurrentWriters(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := range perWriter {
-				errs <- s.InsertJob(ctx, Job{EventID: eventID(w, i), TaskName: "ReconcileLedger"})
+				errs <- s.InsertJob(ctx, eventID(w, i), "ReconcileLedger")
 			}
 		}()
 	}
@@ -253,7 +253,7 @@ func TestInsertJobFlushesPartialBatch(t *testing.T) {
 	// dead timer into a failure instead of a hang.
 	done := make(chan error, 1)
 	go func() {
-		done <- s.InsertJob(t.Context(), Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"})
+		done <- s.InsertJob(t.Context(), "evt-0007-1a2b3c4d", "ReconcileLedger")
 	}()
 
 	select {
@@ -285,7 +285,7 @@ func TestInsertJobFailsOnceWriterStopped(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- s.InsertJob(ctx, Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"})
+		done <- s.InsertJob(ctx, "evt-0007-1a2b3c4d", "ReconcileLedger")
 	}()
 
 	select {
@@ -352,7 +352,7 @@ func assertInsertFails(t *testing.T, s *Store, ctx context.Context, want error) 
 
 	done := make(chan error, 1)
 	go func() {
-		done <- s.InsertJob(ctx, Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"})
+		done <- s.InsertJob(ctx, "evt-0007-1a2b3c4d", "ReconcileLedger")
 	}()
 
 	select {

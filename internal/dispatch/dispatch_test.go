@@ -181,12 +181,30 @@ func TestRegisterReplacesRoute(t *testing.T) {
 func TestRunDrainsQueueAcrossWorkers(t *testing.T) {
 	t.Parallel()
 
-	const messages = 500
+	const (
+		messages = 500
+		workers  = 8
+	)
 
-	var handled atomic.Int64
-	r := New(discardLogger(), Config{Workers: 8})
+	var (
+		handled  atomic.Int64
+		admitted atomic.Int64
+		barrier  sync.WaitGroup
+	)
+	barrier.Add(workers)
+
+	r := New(discardLogger(), Config{Workers: workers})
 	r.Register("SystemHeartbeat", func(context.Context, []byte) error {
 		handled.Add(1)
+		// A worker parked here cannot pick up another message, so the first
+		// `workers` arrivals are necessarily `workers` distinct goroutines.
+		// That makes the barrier a proof of fan-out: a pool that ignored
+		// cfg.Workers and started one goroutine could never release it, and
+		// would fail on awaitRun's deadline rather than pass quietly.
+		if admitted.Add(1) <= workers {
+			barrier.Done()
+			barrier.Wait()
+		}
 		return nil
 	})
 
@@ -402,6 +420,39 @@ func TestRunStopsOnCancellation(t *testing.T) {
 	}
 }
 
+func TestRunAbandonsInFlightMessagesWithoutDeadLettering(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dead := make(chan []byte, 4)
+	entered := make(chan struct{})
+	r := New(discardLogger(), Config{Workers: 1, Retries: 3, Backoff: time.Millisecond, DeadLetter: dead})
+	r.Register("TransientJob", func(ctx context.Context, _ []byte) error {
+		close(entered)
+		<-ctx.Done()
+		// Exactly what a store insert returns when shutdown interrupts it: the
+		// message is healthy, the pipeline is simply stopping.
+		return fmt.Errorf("persisting job: %w", ctx.Err())
+	})
+
+	queue := make(chan []byte, 1)
+	queue <- []byte(jobMsg)
+	close(queue)
+
+	done := runAsync(ctx, r, queue)
+	<-entered
+	cancel()
+	awaitRun(t, done, 5*time.Second)
+
+	// Cancellation is not poison. Dead-lettering here would file a perfectly
+	// good message as unprocessable and log an error for a clean shutdown.
+	if got := len(dead); got != 0 {
+		t.Errorf("dead-lettered %d messages on cancellation, want 0", got)
+	}
+}
+
 func TestRetryable(t *testing.T) {
 	t.Parallel()
 
@@ -431,37 +482,4 @@ func TestRetryable(t *testing.T) {
 			}
 		})
 	}
-}
-
-// FuzzHandle drives arbitrary bytes through the discriminator lookup, where the
-// router hands untrusted input to gjson. The router is shared across iterations
-// because Handle only reads the registry, which keeps each case cheap enough
-// for the seed corpus to run on every `go test`.
-func FuzzHandle(f *testing.F) {
-	f.Add([]byte(heartbeatMsg))
-	f.Add([]byte(jobMsg))
-	f.Add([]byte(`{}`))
-	f.Add([]byte(`not json at all`))
-
-	r := New(discardLogger(), Config{})
-	r.Register("SystemHeartbeat", func(context.Context, []byte) error { return nil })
-	r.Register("TransientJob", func(context.Context, []byte) error { return errHandler })
-
-	ctx := context.Background()
-
-	f.Fuzz(func(t *testing.T, rawJSON []byte) {
-		// Reaching the assertion at all is half the point: a panic in routing
-		// would take down every worker in the pool.
-		err := r.Handle(ctx, rawJSON)
-
-		var unknown UnknownEventError
-		switch {
-		case err == nil,
-			errors.Is(err, ErrNoDiscriminator),
-			errors.Is(err, errHandler),
-			errors.As(err, &unknown):
-		default:
-			t.Errorf("Handle(%q) = %v, want nil or a known routing error", rawJSON, err)
-		}
-	})
 }

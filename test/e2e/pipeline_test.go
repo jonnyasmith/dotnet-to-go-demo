@@ -120,9 +120,10 @@ func newHarness(t *testing.T) *harness {
 }
 
 // shutdown tears the stages down in dependency order, and must be called only
-// once router.Run has returned. Nothing can dead-letter once the workers are
-// done, and nothing can insert once the dead-letter reaper has finished, so
-// closing in this order is what makes the shutdown race-free.
+// once router.Run has returned. Each step closes the tap upstream of the thing
+// it stops: the workers are the only senders on deadLetters, so the close is
+// safe only after Run; and they are the only callers blocked on an insert
+// acknowledgement, so stopping the writer earlier would strand one for good.
 func (h *harness) shutdown() {
 	close(h.deadLetters)
 	h.reaper.Wait()
@@ -271,8 +272,8 @@ type countingStore struct {
 	acked atomic.Int64
 }
 
-func (c *countingStore) InsertJob(ctx context.Context, job store.Job) error {
-	if err := c.inner.InsertJob(ctx, job); err != nil {
+func (c *countingStore) InsertJob(ctx context.Context, eventID, taskName string) error {
+	if err := c.inner.InsertJob(ctx, eventID, taskName); err != nil {
 		return err
 	}
 	c.acked.Add(1)
@@ -306,11 +307,7 @@ func TestCancellationLeavesDatabaseConsistent(t *testing.T) {
 	// producer is still going.
 	time.AfterFunc(25*time.Millisecond, cancel)
 
-	start := time.Now()
 	h.runToCompletion(t, ctx, messages, cancelBudget)
-	if elapsed := time.Since(start); elapsed > cancelBudget {
-		t.Errorf("shutdown took %s, want under %s", elapsed, cancelBudget)
-	}
 
 	// The run context is cancelled, so the queries need one that is not.
 	query := context.WithoutCancel(ctx)
@@ -328,8 +325,10 @@ func TestCancellationLeavesDatabaseConsistent(t *testing.T) {
 		t.Errorf("persisted %d rows, want between %d and %d (acknowledged inserts, plus at most one in flight per worker)",
 			rows, acked, acked+workerCount)
 	}
-	if rows > totalMessages {
-		t.Errorf("persisted %d rows from at most %d produced messages", rows, totalMessages)
+	// Cancellation is not poison: every message here is well-formed, so an
+	// interrupted insert must be abandoned rather than filed as unprocessable.
+	if n := len(h.reaped); n != 0 {
+		t.Errorf("cancellation dead-lettered %d healthy messages: %v", n, payloads(h.reaped))
 	}
 
 	ids, err := h.store.EventIDs(query)

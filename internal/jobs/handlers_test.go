@@ -11,20 +11,26 @@ import (
 	"testing"
 
 	"github.com/jonny/go-demo/internal/dispatch"
-	"github.com/jonny/go-demo/internal/store"
 )
+
+// insertion is what the fake records. JobStore deals in primitives, so this
+// test package needs no type from internal/store at all.
+type insertion struct {
+	eventID  string
+	taskName string
+}
 
 // These are unit tests with no database. That is the whole reason JobStore is
 // an interface declared in this package: the fake below is the entire test
 // double, with no mocking framework behind it.
 type fakeStore struct {
 	mu       sync.Mutex
-	inserted []store.Job
+	inserted []insertion
 	seenCtx  context.Context
 	err      error
 }
 
-func (f *fakeStore) InsertJob(ctx context.Context, job store.Job) error {
+func (f *fakeStore) InsertJob(ctx context.Context, eventID, taskName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -32,11 +38,11 @@ func (f *fakeStore) InsertJob(ctx context.Context, job store.Job) error {
 	if f.err != nil {
 		return f.err
 	}
-	f.inserted = append(f.inserted, job)
+	f.inserted = append(f.inserted, insertion{eventID: eventID, taskName: taskName})
 	return nil
 }
 
-func (f *fakeStore) jobs() []store.Job {
+func (f *fakeStore) insertions() []insertion {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.inserted
@@ -56,11 +62,11 @@ func TestJobHandlerMapsEnvelopeOntoJob(t *testing.T) {
 		t.Fatalf("handler returned %v, want nil", err)
 	}
 
-	got := fake.jobs()
+	got := fake.insertions()
 	if len(got) != 1 {
 		t.Fatalf("store received %d jobs, want 1", len(got))
 	}
-	want := store.Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"}
+	want := insertion{eventID: "evt-0007-1a2b3c4d", taskName: "ReconcileLedger"}
 	if got[0] != want {
 		t.Errorf("store received %+v, want %+v", got[0], want)
 	}
@@ -99,7 +105,7 @@ func TestJobHandlerRejectsBadPayloadsPermanently(t *testing.T) {
 			if dispatch.Retryable(err) {
 				t.Errorf("error %v is retryable, want permanent", err)
 			}
-			if n := len(fake.jobs()); n != 0 {
+			if n := len(fake.insertions()); n != 0 {
 				t.Errorf("store received %d jobs, want 0", n)
 			}
 		})
@@ -161,15 +167,13 @@ func TestHeartbeatHandlerLogsAndDiscards(t *testing.T) {
 
 	buf := &bytes.Buffer{}
 	log := slog.New(slog.NewTextHandler(buf, nil))
-	fake := &fakeStore{}
 
+	// The handler takes no store, so the only observable behaviour is the log
+	// line: there is no database call to assert the absence of.
 	if err := NewHeartbeatHandler(log)(context.Background(), []byte(`{"eventType":"SystemHeartbeat"}`)); err != nil {
 		t.Fatalf("handler returned %v, want nil", err)
 	}
 
-	if n := len(fake.jobs()); n != 0 {
-		t.Errorf("store received %d jobs, want 0: heartbeats never reach the database", n)
-	}
 	if !strings.Contains(buf.String(), "heartbeat received and discarded") {
 		t.Errorf("log output = %q, want the discard message", buf.String())
 	}

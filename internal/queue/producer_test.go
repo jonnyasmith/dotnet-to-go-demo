@@ -37,13 +37,20 @@ var eventValidators = map[string]func(t *testing.T, msg gjson.Result){
 	},
 }
 
+// testNow is the pinned clock every collected run uses. Heartbeat payloads
+// embed a timestamp, so without pinning it two runs of the same seed differ
+// whenever the wall-clock second ticks over between them.
+func testNow() time.Time { return time.Date(2026, 8, 5, 9, 41, 0, 0, time.UTC) }
+
 // collect runs p to completion and returns every message it emitted. The
-// producer's sleep is replaced so spacing costs nothing, and the channel is
-// buffered to count so Run never blocks on the (single-goroutine) reader.
+// producer's sleep and clock are both replaced: spacing then costs nothing and
+// the stream depends on the seed alone. The channel is buffered to count so
+// Run never blocks on the (single-goroutine) reader.
 func collect(t *testing.T, p *Producer, count int) [][]byte {
 	t.Helper()
 
 	p.sleep = func(context.Context, time.Duration) bool { return true }
+	p.now = testNow
 
 	out := make(chan []byte, max(count, 1))
 	p.Run(t.Context(), out, count)
@@ -108,30 +115,41 @@ func TestProducerSameSeedReplaysIdenticalStream(t *testing.T) {
 
 	const count = 64
 
-	// Heartbeat payloads embed time.Now() at second precision, so two runs are
-	// only byte-comparable while the wall clock second holds still. Retry the
-	// rare straddle instead of weakening the comparison.
-	for range 3 {
-		second := time.Now().Unix()
-		first := collect(t, NewProducer(42, time.Millisecond), count)
-		repeat := collect(t, NewProducer(42, time.Millisecond), count)
-		if time.Now().Unix() != second {
+	first := collect(t, NewProducer(42, time.Millisecond), count)
+	repeat := collect(t, NewProducer(42, time.Millisecond), count)
+
+	if len(first) != count || len(repeat) != count {
+		t.Fatalf("emitted %d and %d messages, want %d each", len(first), len(repeat), count)
+	}
+	for i := range first {
+		if !bytes.Equal(first[i], repeat[i]) {
+			t.Errorf("message %d differs between runs:\n first: %s\nrepeat: %s", i, first[i], repeat[i])
+		}
+	}
+}
+
+// The determinism above only means anything if the payloads actually read the
+// injected clock; a producer that went back to time.Now() would still replay
+// identically inside a single second.
+func TestHeartbeatTimestampComesFromTheInjectedClock(t *testing.T) {
+	t.Parallel()
+
+	const count = 64
+
+	want := testNow().UTC().Format(time.RFC3339)
+	heartbeats := 0
+	for i, raw := range collect(t, NewProducer(42, time.Millisecond), count) {
+		if gjson.GetBytes(raw, "eventType").String() != jobs.EventHeartbeat {
 			continue
 		}
-
-		if len(first) != count || len(repeat) != count {
-			t.Fatalf("emitted %d and %d messages, want %d each", len(first), len(repeat), count)
+		heartbeats++
+		if got := gjson.GetBytes(raw, "timestamp").String(); got != want {
+			t.Errorf("heartbeat %d has timestamp %q, want the pinned %q", i, got, want)
 		}
-		for i := range first {
-			if !bytes.Equal(first[i], repeat[i]) {
-				t.Errorf("message %d differs between runs:\n first: %s\nrepeat: %s", i, first[i], repeat[i])
-			}
-		}
-
-		return
 	}
-
-	t.Fatal("the clock ticked over during every attempt, so no comparison was made")
+	if heartbeats == 0 {
+		t.Fatal("no heartbeats in the run, so the clock was never exercised")
+	}
 }
 
 func TestProducerDifferentSeedsDiverge(t *testing.T) {

@@ -19,13 +19,17 @@ var taskNames = []string{
 // Producer pushes raw JSON onto a channel.
 //
 // The generator is a field rather than the package-level source so a test can
-// pin the seed and replay a byte-for-byte identical stream.
+// pin the seed and replay a byte-for-byte identical stream. That replay only
+// holds if the clock is pinned too, which is why now is a field as well.
 type Producer struct {
 	rng      *rand.Rand
 	interval time.Duration
 	// sleep is swapped out by tests so spacing can be asserted without
 	// spending the wall-clock time.
 	sleep func(ctx context.Context, d time.Duration) bool
+	// now is swapped out by tests so heartbeat payloads stop depending on
+	// when the test happened to run.
+	now func() time.Time
 }
 
 // NewProducer builds a producer with a fixed seed and message spacing.
@@ -34,6 +38,7 @@ func NewProducer(seed uint64, interval time.Duration) *Producer {
 		rng:      rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)),
 		interval: interval,
 		sleep:    sleepCtx,
+		now:      time.Now,
 	}
 }
 
@@ -60,7 +65,7 @@ func (p *Producer) payload(seq int) []byte {
 	if p.rng.IntN(2) == 0 {
 		return fmt.Appendf(nil,
 			`{"eventType":%q,"timestamp":%q}`,
-			jobs.EventHeartbeat, time.Now().UTC().Format(time.RFC3339),
+			jobs.EventHeartbeat, p.now().UTC().Format(time.RFC3339),
 		)
 	}
 

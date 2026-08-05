@@ -162,8 +162,10 @@ the declaration to keep in sync. This is deliberately the opposite of the .NET
 habit of shipping `IFoo` next to `Foo` — an interface with exactly one
 implementation, written by the implementer, buys nothing here. Declaring it at
 the consumer means the dependency is described as narrowly as the consumer's
-actual needs, and a test can satisfy `JobStore` with a struct carrying one
-method: no mocking library, no reference to SQLite.
+actual needs. It is narrow in its *types* too: the method takes an event id and
+a task name rather than a `store.Job`, so satisfying it costs the caller no
+import of `internal/store` either. A test can therefore supply a struct with
+one method — no mocking library, and nothing from the SQLite package at all.
 
 **`context.Context` is threaded through everything.** Treat it as
 `CancellationToken` with two extra jobs (deadlines and request-scoped values).
@@ -217,6 +219,13 @@ failure is returned unwrapped and so gets retried. `PermanentError` implements
 those two are the Go replacement for `catch (SomeSpecificException)`, and
 `UnknownEventError` is a struct precisely so a caller can recover the offending
 event type with `errors.As` rather than parsing a message string.
+
+Cancellation is not poison, and the pool keeps the two apart. When Ctrl-C
+interrupts a handler mid-insert it fails with `context.Canceled`, which is not
+the message's fault: `deliver` checks `ctx.Err()` after a failed attempt and
+abandons the payload with a debug line instead of dead-lettering it. Without
+that check a clean shutdown would log up to `Workers` perfectly good messages
+as unprocessable — the loudest possible way to report that nothing went wrong.
 
 **Shutdown ordering.** `run` unwinds in dependency order, and the order is the
 whole trick:
@@ -295,11 +304,19 @@ fuzz finding turns into a repeatable regression test.
 **Unit** — `internal/dispatch`, `internal/jobs`, `internal/queue`. No database,
 no files, and no waiting on the wall clock. The router's tests register
 substitute handlers; `NewJobHandler` takes a `JobStore`, so a test hands it a
-struct with one method rather than a database; the producer's unexported `sleep`
-field is swapped out so message spacing can be asserted without actually
-spending it. These tests live in the same package as the code, which is what
-lets them reach an unexported field at all — the `InternalsVisibleTo` question
-never arises.
+struct with one method rather than a database; the producer's unexported
+`sleep` and `now` fields are both swapped out, so message spacing can be
+asserted without spending it and a seeded run replays byte for byte. These
+tests live in the same package as the code, which is what lets them reach an
+unexported field at all — the `InternalsVisibleTo` question never arises.
+
+`internal/dispatch/fuzz_test.go` is the exception, and the reason is worth
+knowing. It declares `package dispatch_test`, an *external* test package
+compiled separately from `dispatch` itself. That is what lets it import
+`internal/jobs` and fuzz the real handlers: `jobs` imports `dispatch`, so an
+in-package test file reaching for them would close an import cycle and fail to
+build. A directory may hold both packages at once, and this is what the second
+one is for.
 
 **Integration** — `internal/store`. Real SQLite files created under
 `t.TempDir()` and removed automatically. Mocking the database here would only

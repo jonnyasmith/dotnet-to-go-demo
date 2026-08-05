@@ -149,11 +149,12 @@ func (r *Router) work(ctx context.Context, id int, queue <-chan []byte) {
 }
 
 // deliver attempts one message, retrying transient failures with exponential
-// backoff before dead-lettering it.
+// backoff before dead-lettering it. A message interrupted by cancellation is
+// abandoned rather than dead-lettered: it was never judged on its own merits.
 func (r *Router) deliver(ctx context.Context, id int, payload []byte) {
 	var err error
 
-	for attempt := 0; attempt <= r.cfg.Retries; attempt++ {
+	for attempt := range r.cfg.Retries + 1 {
 		if attempt > 0 {
 			r.log.Warn("retrying message", "worker", id, "attempt", attempt+1, "error", err)
 			if !sleep(ctx, r.cfg.Backoff<<(attempt-1)) {
@@ -162,6 +163,13 @@ func (r *Router) deliver(ctx context.Context, id int, payload []byte) {
 		}
 
 		if err = r.Handle(ctx, payload); err == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			// Shutdown, not poison: the handler failed because the pipeline is
+			// stopping. Dead-lettering here would file a perfectly good message
+			// as unprocessable and log an error for what is a clean exit.
+			r.log.Debug("message abandoned mid-flight", "worker", id, "error", err)
 			return
 		}
 		if !Retryable(err) {

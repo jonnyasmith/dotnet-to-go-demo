@@ -178,11 +178,16 @@ func (s *Store) writeBatch(ctx context.Context, batch []writeRequest) error {
 }
 
 // InsertJob hands the job to the writer and waits for the batch to commit.
-func (s *Store) InsertJob(ctx context.Context, job Job) error {
+//
+// It takes primitives and maps them onto Job here so that callers need no type
+// from this package: internal/jobs declares the interface this satisfies, and
+// its handlers stay free of anything SQLite.
+func (s *Store) InsertJob(ctx context.Context, eventID, taskName string) error {
 	ack := make(chan error, 1)
+	req := writeRequest{job: Job{EventID: eventID, TaskName: taskName}, ack: ack}
 
 	select {
-	case s.writes <- writeRequest{job: job, ack: ack}:
+	case s.writes <- req:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
