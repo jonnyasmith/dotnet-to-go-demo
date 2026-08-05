@@ -14,11 +14,6 @@ coverage.*
 go.work
 go.work.sum
 
-# Local database artefacts produced at runtime
-*.db
-*.db-shm
-*.db-wal
-
 # Editor and OS noise
 .DS_Store
 .idea/

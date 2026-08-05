@@ -6,10 +6,6 @@
 .gitignore
 .gitattributes
 .vscode
-data
-*.db
-*.db-shm
-*.db-wal
 /processor
 *.test
 *.out

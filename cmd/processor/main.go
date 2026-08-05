@@ -1,13 +1,15 @@
-// Command processor runs the transient job queue demo: a producer feeds raw
-// JSON to a pool of workers, which route each message to a handler.
+// Command processor runs the transient job queue demo against RabbitMQ and
+// Postgres.
 package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -19,37 +21,95 @@ import (
 )
 
 const (
-	databasePath   = "demo.db"
-	workerCount    = 5
-	messageCount   = 40
-	messageSpacing = 25 * time.Millisecond
-	queueDepth     = 16
-	retries        = 2
-	retryBackoff   = 20 * time.Millisecond
+	defaultAMQPURL     = "amqp://guest:guest@localhost:5672/"
+	defaultDatabaseURL = "postgres://postgres:postgres@localhost:5432/jobs?sslmode=disable"
+	messageCount       = 40
+	messageSpacing     = 25 * time.Millisecond
+	queueDepth         = 16
+	retryBackoff       = 20 * time.Millisecond
 )
+
+type config struct {
+	AMQPURL     string
+	DatabaseURL string
+	Workers     int
+	Retries     int
+	Seed        uint64
+	Topology    queue.Topology
+}
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	if err := run(log); err != nil {
+	cfg, err := configFromEnv()
+	if err != nil {
+		log.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, log, cfg); err != nil {
 		log.Error("fatal", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger) error {
-	// Ctrl-C or SIGTERM cancels ctx; a second signal restores the default
-	// behaviour and kills the process.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+func configFromEnv() (config, error) {
+	workers, err := positiveEnv("WORKER_COUNT", 5)
+	if err != nil {
+		return config{}, err
+	}
+	retries, err := nonNegativeEnv("RETRY_BUDGET", 2)
+	if err != nil {
+		return config{}, err
+	}
+	return config{
+		AMQPURL:     envOr("AMQP_URL", defaultAMQPURL),
+		DatabaseURL: envOr("DATABASE_URL", defaultDatabaseURL),
+		Workers:     workers,
+		Retries:     retries,
+		Seed:        rand.Uint64(),
+		Topology:    queue.DefaultTopology,
+	}, nil
+}
 
-	st, err := store.Open(databasePath)
+func envOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func positiveEnv(name string, fallback int) (int, error) {
+	value, err := nonNegativeEnv(name, fallback)
+	if err != nil {
+		return 0, err
+	}
+	if value == 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", name)
+	}
+	return value, nil
+}
+
+func nonNegativeEnv(name string, fallback int) (int, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer, got %q", name, raw)
+	}
+	return value, nil
+}
+
+func run(ctx context.Context, log *slog.Logger, cfg config) error {
+	st, err := store.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	// The writer gets its own context: it must outlive ctx so that handlers
-	// interrupted mid-insert still receive an answer rather than blocking.
 	writerCtx, stopWriter := context.WithCancel(context.Background())
 	var writer sync.WaitGroup
 	writer.Add(1)
@@ -58,47 +118,52 @@ func run(log *slog.Logger) error {
 		st.RunWriter(writerCtx)
 	}()
 
-	deadLetters := make(chan []byte, queueDepth)
-	var reaper sync.WaitGroup
-	reaper.Add(1)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	deliveries := make(chan dispatch.Delivery, queueDepth)
+	consumer := queue.Consumer{
+		URL: cfg.AMQPURL, Topology: cfg.Topology, Prefetch: cfg.Workers, Log: log,
+		DrainDeadLetters: true,
+	}
+	var consumers sync.WaitGroup
+	consumers.Add(1)
 	go func() {
-		defer reaper.Done()
-		var n int
-		for msg := range deadLetters {
-			n++
-			log.Warn("dead letter", "payload", string(msg))
-		}
-		if n > 0 {
-			log.Warn("dead letters recorded", "count", n)
-		}
+		defer consumers.Done()
+		consumer.Run(runCtx, deliveries)
 	}()
 
 	router := dispatch.New(log, dispatch.Config{
-		Workers:    workerCount,
-		Retries:    retries,
-		Backoff:    retryBackoff,
-		DeadLetter: deadLetters,
+		Workers: cfg.Workers, Retries: cfg.Retries, Backoff: retryBackoff,
 	})
 	router.Register(jobs.EventHeartbeat, jobs.NewHeartbeatHandler(log))
 	router.Register(jobs.EventJob, jobs.NewJobHandler(log, st))
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		router.Run(runCtx, deliveries)
+	}()
+	shutdown := func() {
+		cancel()
+		consumers.Wait()
+		workers.Wait()
+		stopWriter()
+		writer.Wait()
+	}
 
-	messages := make(chan []byte, queueDepth)
-	go queue.NewProducer(rand.Uint64(), messageSpacing).Run(ctx, messages, messageCount)
+	publisher := queue.NewProducer(cfg.AMQPURL, cfg.Topology, cfg.Seed, messageSpacing)
+	if err := publisher.Run(runCtx, messageCount); err != nil && ctx.Err() == nil {
+		shutdown()
+		return err
+	}
 
-	// Blocks until the producer closes the queue and every worker returns.
-	router.Run(ctx, messages)
-
-	// Shut the stages down in dependency order: nothing can dead-letter once
-	// the workers are done, and nothing can insert once they have stopped.
-	close(deadLetters)
-	reaper.Wait()
-	stopWriter()
-	writer.Wait()
+	<-ctx.Done()
+	shutdown()
 
 	persisted, err := st.CountJobs(context.WithoutCancel(ctx))
 	if err != nil {
 		return err
 	}
-	log.Info("shutdown complete", "jobsPersisted", persisted, "database", databasePath)
+	log.Info("shutdown complete", "jobsPersisted", persisted)
 	return nil
 }

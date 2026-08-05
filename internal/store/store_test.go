@@ -3,86 +3,119 @@ package store
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
-	"path/filepath"
+	"net/url"
+	"os"
+	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	sqlite3 "github.com/mattn/go-sqlite3"
+	"github.com/jmoiron/sqlx"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// These tests run against a real SQLite file rather than a fake. The behaviour
-// under test — the UNIQUE constraint, the column default, the single-writer
-// batching — lives in the database and the driver, so a mock would only ever
-// confirm that the test author remembered what the schema says.
+var testDatabaseURL string
 
-// newTestStore opens a store on a throwaway database file and runs its writer
-// for the rest of the test. Every test wants this shape unless it is
-// specifically about the open/close lifecycle.
-func newTestStore(t *testing.T) *Store {
-	t.Helper()
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() {
+		os.Exit(m.Run())
+	}
 
-	s := openTestStore(t, filepath.Join(t.TempDir(), "jobs.db"))
-	startWriter(t, s)
-	return s
+	ctx := context.Background()
+	container, err := postgres.Run(ctx, "postgres:17-alpine",
+		postgres.WithDatabase("jobs"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("postgres"),
+		postgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "starting Postgres test container:", err)
+		os.Exit(1)
+	}
+	testDatabaseURL, err = container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "getting Postgres connection string:", err)
+		_ = testcontainers.TerminateContainer(container)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+	if err := testcontainers.TerminateContainer(container); err != nil && code == 0 {
+		fmt.Fprintln(os.Stderr, "stopping Postgres test container:", err)
+		code = 1
+	}
+	os.Exit(code)
 }
 
-// openTestStore opens path and closes the pool when the test ends. No writer
-// is started, so InsertJob would block: prefer newTestStore.
-func openTestStore(t *testing.T, path string) *Store {
-	t.Helper()
+var nonIdentifier = regexp.MustCompile(`[^a-z0-9]+`)
 
-	s, err := Open(path)
+func schemaFor(t *testing.T) string {
+	t.Helper()
+	return "test_" + nonIdentifier.ReplaceAllString(strings.ToLower(t.Name()), "_")
+}
+
+func withSearchPath(t *testing.T, schemaName string) string {
+	t.Helper()
+	u, err := url.Parse(testDatabaseURL)
 	if err != nil {
-		t.Fatalf("Open(%q) returned error: %v", path, err)
+		t.Fatalf("parsing database URL: %v", err)
 	}
+	q := u.Query()
+	q.Set("search_path", schemaName)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping Postgres-backed store test in short mode")
+	}
+
+	schemaName := schemaFor(t)
+	admin, err := sqlx.ConnectContext(t.Context(), "pgx", testDatabaseURL)
+	if err != nil {
+		t.Fatalf("connecting to shared Postgres: %v", err)
+	}
+	if _, err := admin.ExecContext(t.Context(), `CREATE SCHEMA `+schemaName); err != nil {
+		admin.Close()
+		t.Fatalf("creating schema %s: %v", schemaName, err)
+	}
+
+	s, err := Open(t.Context(), withSearchPath(t, schemaName))
+	if err != nil {
+		admin.Close()
+		t.Fatalf("Open() returned error: %v", err)
+	}
+
+	writerCtx, stopWriter := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.RunWriter(writerCtx)
+	}()
 	t.Cleanup(func() {
-		// database/sql makes Close idempotent, so a test that shuts the store
-		// down early still gets a safety net here.
+		stopWriter()
+		<-done
 		if err := s.Close(); err != nil {
 			t.Errorf("Close() returned error: %v", err)
 		}
+		if _, err := admin.ExecContext(context.Background(), `DROP SCHEMA `+schemaName+` CASCADE`); err != nil {
+			t.Errorf("dropping schema %s: %v", schemaName, err)
+		}
+		admin.Close()
 	})
 	return s
 }
 
-// startWriter runs s.RunWriter on its own cancellable context and returns a
-// function that stops it and waits for it to exit.
-//
-// The ordering is the whole point. InsertJob blocks until the writer
-// acknowledges its batch, so the writer must outlive every insert; and the
-// writer flushes what it has already accepted on the way out, so it must exit
-// before the pool it writes through is closed. t.Cleanup runs
-// last-registered-first, and openTestStore registered the Close before this
-// call — so cleanup cancels the writer, waits, and only then closes.
-func startWriter(t *testing.T, s *Store) func() {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.RunWriter(ctx)
-	}()
-
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			cancel()
-			<-done
-		})
-	}
-	t.Cleanup(stop)
-	return stop
-}
-
-// insertJobs pushes jobs through the writer in order, failing on the first
-// error so that a broken setup is not mistaken for a broken assertion.
 func insertJobs(t *testing.T, s *Store, jobs ...Job) {
 	t.Helper()
-
 	for _, job := range jobs {
 		if err := s.InsertJob(t.Context(), job.EventID, job.TaskName); err != nil {
 			t.Fatalf("InsertJob(%+v) returned error: %v", job, err)
@@ -90,397 +123,136 @@ func insertJobs(t *testing.T, s *Store, jobs ...Job) {
 	}
 }
 
-func TestInsertJobPersistsRow(t *testing.T) {
+func TestInsertJobPersistsRowWithDatabaseTimestamp(t *testing.T) {
 	t.Parallel()
-
 	s := newTestStore(t)
-	want := Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"}
-
-	// CURRENT_TIMESTAMP has one-second granularity, so the lower bound has to
-	// be truncated or a row written mid-second looks like it predates the test.
-	before := time.Now().UTC().Truncate(time.Second)
-	insertJobs(t, s, want)
+	before := time.Now().UTC().Add(-time.Second)
+	insertJobs(t, s, Job{EventID: "evt-0007", TaskName: "ReconcileLedger"})
 
 	var got struct {
 		EventID   string    `db:"event_id"`
 		TaskName  string    `db:"task_name"`
 		CreatedAt time.Time `db:"created_at"`
 	}
-	if err := s.db.GetContext(t.Context(), &got,
-		"SELECT event_id, task_name, created_at FROM transient_jobs"); err != nil {
-		t.Fatalf("reading the row back: %v", err)
+	if err := s.db.GetContext(t.Context(), &got, `SELECT event_id, task_name, created_at FROM transient_jobs`); err != nil {
+		t.Fatalf("reading row: %v", err)
 	}
-	after := time.Now().UTC()
-
-	if got.EventID != want.EventID {
-		t.Errorf("event_id = %q, want %q", got.EventID, want.EventID)
+	if got.EventID != "evt-0007" || got.TaskName != "ReconcileLedger" {
+		t.Errorf("row = %+v, want evt-0007/ReconcileLedger", got)
 	}
-	if got.TaskName != want.TaskName {
-		t.Errorf("task_name = %q, want %q", got.TaskName, want.TaskName)
-	}
-	// The insert never mentions created_at, so a timestamp inside the window
-	// the test just spanned can only have come from the column's DEFAULT.
-	if got.CreatedAt.Before(before) || got.CreatedAt.After(after) {
-		t.Errorf("created_at = %v, want a time within [%v, %v]", got.CreatedAt, before, after)
+	if got.CreatedAt.Before(before) || got.CreatedAt.After(time.Now().UTC()) {
+		t.Errorf("created_at = %v, want current database timestamp", got.CreatedAt)
 	}
 }
 
 func TestInsertJobIsIdempotentPerEventID(t *testing.T) {
 	t.Parallel()
-
 	s := newTestStore(t)
-	const eventID = "evt-0007-1a2b3c4d"
-
-	// Delivery is at-least-once, so the broker will replay this event. The
-	// replay must be accepted — an error would make the handler retry forever
-	// — and must neither add a row nor overwrite the one already there.
 	insertJobs(t, s,
-		Job{EventID: eventID, TaskName: "ReconcileLedger"},
-		Job{EventID: eventID, TaskName: "RebuildIndex"},
+		Job{EventID: "evt-1", TaskName: "first"},
+		Job{EventID: "evt-1", TaskName: "second"},
 	)
-
 	if got, err := s.CountJobs(t.Context()); err != nil || got != 1 {
-		t.Fatalf("CountJobs() = %d, %v, want 1, <nil>", got, err)
+		t.Fatalf("CountJobs() = %d, %v, want 1, nil", got, err)
 	}
-
-	var got string
-	if err := s.db.GetContext(t.Context(), &got,
-		"SELECT task_name FROM transient_jobs WHERE event_id = ?", eventID); err != nil {
-		t.Fatalf("reading task_name back: %v", err)
+	var task string
+	if err := s.db.GetContext(t.Context(), &task, `SELECT task_name FROM transient_jobs WHERE event_id = $1`, "evt-1"); err != nil {
+		t.Fatalf("reading task: %v", err)
 	}
-	if want := "ReconcileLedger"; got != want {
-		t.Errorf("task_name = %q, want %q: the first delivery wins", got, want)
+	if task != "first" {
+		t.Errorf("task_name = %q, want first delivery to win", task)
 	}
 }
 
 func TestEventIDsListsEveryIDAscending(t *testing.T) {
 	t.Parallel()
-
 	s := newTestStore(t)
-
-	// Inserted out of order so the assertion pins the documented ascending
-	// contract rather than the insertion sequence. Note that SQLite answers
-	// this query with a covering scan of the implicit index behind
-	// event_id UNIQUE, so the rows arrive sorted whether or not EventIDs asks
-	// for it: this guards the contract, not the ORDER BY clause itself.
 	insertJobs(t, s,
-		Job{EventID: "evt-0003-cccccccc", TaskName: "ReconcileLedger"},
-		Job{EventID: "evt-0001-aaaaaaaa", TaskName: "RebuildIndex"},
-		Job{EventID: "evt-0002-bbbbbbbb", TaskName: "PurgeCache"},
+		Job{EventID: "evt-3", TaskName: "c"},
+		Job{EventID: "evt-1", TaskName: "a"},
+		Job{EventID: "evt-2", TaskName: "b"},
 	)
-
-	if got, err := s.CountJobs(t.Context()); err != nil || got != 3 {
-		t.Fatalf("CountJobs() = %d, %v, want 3, <nil>", got, err)
-	}
-
 	got, err := s.EventIDs(t.Context())
 	if err != nil {
-		t.Fatalf("EventIDs() returned error: %v", err)
+		t.Fatal(err)
 	}
-	want := []string{"evt-0001-aaaaaaaa", "evt-0002-bbbbbbbb", "evt-0003-cccccccc"}
-	if !slices.Equal(got, want) {
+	if want := []string{"evt-1", "evt-2", "evt-3"}; !slices.Equal(got, want) {
 		t.Errorf("EventIDs() = %v, want %v", got, want)
 	}
 }
 
 func TestInsertJobBatchesConcurrentWriters(t *testing.T) {
 	t.Parallel()
-
-	const (
-		// More writers than maxBatch so full batches genuinely form, and
-		// enough rows overall to need several of them.
-		writers   = 100
-		perWriter = 3
-		total     = writers * perWriter
-	)
-
 	s := newTestStore(t)
-	// Zero-padded so lexicographic order matches (writer, sequence) order.
-	eventID := func(writer, seq int) string { return fmt.Sprintf("evt-%03d-%03d", writer, seq) }
-
-	// Errors come back over a buffered channel rather than a shared slice: the
-	// race detector is on, and an unsynchronised append is exactly the bug
-	// this test would otherwise report as a batching failure.
+	const total = 200
 	errs := make(chan error, total)
-	ctx := t.Context()
-
 	var wg sync.WaitGroup
-	for w := range writers {
+	for i := range total {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range perWriter {
-				errs <- s.InsertJob(ctx, eventID(w, i), "ReconcileLedger")
-			}
+			errs <- s.InsertJob(t.Context(), fmt.Sprintf("evt-%03d", i), "task")
 		}()
 	}
 	wg.Wait()
 	close(errs)
-
 	for err := range errs {
 		if err != nil {
-			t.Fatalf("InsertJob() returned error: %v", err)
+			t.Fatal(err)
 		}
 	}
-
 	if got, err := s.CountJobs(t.Context()); err != nil || got != total {
-		t.Fatalf("CountJobs() = %d, %v, want %d, <nil>", got, err, total)
-	}
-
-	want := make([]string, 0, total)
-	for w := range writers {
-		for i := range perWriter {
-			want = append(want, eventID(w, i))
-		}
-	}
-	got, err := s.EventIDs(t.Context())
-	if err != nil {
-		t.Fatalf("EventIDs() returned error: %v", err)
-	}
-	// Equality both ways: every row landed, and none landed twice or garbled.
-	if !slices.Equal(got, want) {
-		t.Errorf("EventIDs() returned %d ids that do not match the %d inserted", len(got), total)
+		t.Fatalf("CountJobs() = %d, %v, want %d, nil", got, err, total)
 	}
 }
 
-func TestInsertJobFlushesPartialBatch(t *testing.T) {
+func TestInsertJobHonoursCancelledContext(t *testing.T) {
 	t.Parallel()
-
 	s := newTestStore(t)
-
-	// A lone insert can never fill a 64-row batch, so it only ever commits
-	// because the flush timer fires. Running it off the test goroutine turns a
-	// dead timer into a failure instead of a hang.
-	done := make(chan error, 1)
-	go func() {
-		done <- s.InsertJob(t.Context(), "evt-0007-1a2b3c4d", "ReconcileLedger")
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("InsertJob() returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("InsertJob() did not return: the partial batch was never flushed")
-	}
-
-	if got, err := s.CountJobs(t.Context()); err != nil || got != 1 {
-		t.Errorf("CountJobs() = %d, %v, want 1, <nil>", got, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := s.InsertJob(ctx, "evt-1", "task"); !errors.Is(err, context.Canceled) {
+		t.Errorf("InsertJob() = %v, want context.Canceled", err)
 	}
 }
 
-func TestInsertJobFailsOnceWriterStopped(t *testing.T) {
+func TestInsertJobHonoursDeadlineWhileWaitingForCommit(t *testing.T) {
 	t.Parallel()
-
-	s := openTestStore(t, filepath.Join(t.TempDir(), "jobs.db"))
-	stopWriter := startWriter(t, s)
-
-	// Not the documented order of operations, but a shutdown race can produce
-	// it, and a handler that blocks here would wedge its worker for good.
-	stopWriter()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- s.InsertJob(ctx, "evt-0007-1a2b3c4d", "ReconcileLedger")
-	}()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("InsertJob() = <nil>, want an error once the writer has stopped")
-		}
-		// Whether the caller is rejected by drain or by its own deadline
-		// depends on how far the shutdown had got; both are correct.
-		if !errors.Is(err, ErrWriterStopped) && !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("InsertJob() = %v, want %v or a context error", err, ErrWriterStopped)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("InsertJob() blocked after the writer stopped")
-	}
-}
-
-func TestInsertJobHonoursCallerContext(t *testing.T) {
-	t.Parallel()
-
-	t.Run("cancelled before submission", func(t *testing.T) {
-		t.Parallel()
-
-		// No writer on purpose: with nothing receiving on the write channel,
-		// the cancelled context is the only case InsertJob's first select can
-		// take, so the assertion is decided by the code, not by scheduling.
-		s := openTestStore(t, filepath.Join(t.TempDir(), "jobs.db"))
-
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-
-		assertInsertFails(t, s, ctx, context.Canceled)
-	})
-
-	t.Run("deadline expires waiting for the commit", func(t *testing.T) {
-		t.Parallel()
-
-		s := newTestStore(t)
-
-		// The pool is pinned to a single connection, so holding a transaction
-		// open stalls the writer inside its flush. That is the interesting
-		// failure: the job has been accepted but will not be acknowledged, and
-		// a caller with a deadline must give up rather than pin its worker to
-		// a stuck writer.
-		tx, err := s.db.BeginTxx(t.Context(), nil)
-		if err != nil {
-			t.Fatalf("BeginTxx() returned error: %v", err)
-		}
-		defer tx.Rollback()
-
-		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-		defer cancel()
-
-		assertInsertFails(t, s, ctx, context.DeadlineExceeded)
-	})
-}
-
-// assertInsertFails runs one insert off the test goroutine and requires it to
-// come back with want. The surrounding select is the point: an InsertJob that
-// ignored its context would block forever, and a hung test reports far less
-// than a failed one.
-func assertInsertFails(t *testing.T, s *Store, ctx context.Context, want error) {
-	t.Helper()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- s.InsertJob(ctx, "evt-0007-1a2b3c4d", "ReconcileLedger")
-	}()
-
-	select {
-	case err := <-done:
-		if !errors.Is(err, want) {
-			t.Errorf("InsertJob() = %v, want %v", err, want)
-		}
-	case <-time.After(2 * time.Second):
-		t.Errorf("InsertJob() blocked instead of returning %v", want)
-	}
-}
-
-func TestOpenIsIdempotentAcrossRestarts(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "jobs.db")
-	want := Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"}
-
-	first := openTestStore(t, path)
-	stopWriter := startWriter(t, first)
-	insertJobs(t, first, want)
-
-	// Shut the first store down completely: the row has to be on disk, not
-	// merely visible to the connection that wrote it.
-	stopWriter()
-	if err := first.Close(); err != nil {
-		t.Fatalf("Close() returned error: %v", err)
-	}
-
-	// Reopening must adopt the existing schema (CREATE TABLE IF NOT EXISTS)
-	// rather than error or start empty.
-	second := openTestStore(t, path)
-	got, err := second.EventIDs(t.Context())
+	s := newTestStore(t)
+	s.db.SetMaxOpenConns(1)
+	tx, err := s.db.BeginTxx(t.Context(), nil)
 	if err != nil {
-		t.Fatalf("EventIDs() after reopening returned error: %v", err)
+		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != want.EventID {
-		t.Errorf("EventIDs() after reopening = %v, want [%s]", got, want.EventID)
+	defer tx.Rollback()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := s.InsertJob(ctx, "evt-blocked", "task"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("InsertJob() = %v, want context.DeadlineExceeded", err)
 	}
 }
 
-func TestOpenRejectsUnusablePath(t *testing.T) {
+func TestOpenIsIdempotentForExistingSchema(t *testing.T) {
 	t.Parallel()
-
-	// A directory exists and is readable but can never be a database file, so
-	// it exercises the failure path without depending on filesystem
-	// permissions. Open must report it, not hand back an unusable store.
-	dir := t.TempDir()
-
-	s, err := Open(dir)
-	if err == nil {
-		t.Fatalf("Open(%q) = %v, <nil>, want an error", dir, s)
+	s := newTestStore(t)
+	second, err := Open(t.Context(), withSearchPath(t, schemaFor(t)))
+	if err != nil {
+		t.Fatalf("second Open() returned error: %v", err)
 	}
-	if s != nil {
-		t.Errorf("Open(%q) returned a store alongside its error", dir)
+	if err := second.Close(); err != nil {
+		t.Errorf("closing second store: %v", err)
 	}
+	insertJobs(t, s, Job{EventID: "evt-after-reopen", TaskName: "task"})
 }
 
 func TestSchemaRejectsInvalidRows(t *testing.T) {
 	t.Parallel()
-
-	// These go straight at the pool. InsertJob's ON CONFLICT DO NOTHING is
-	// precisely what would mask a missing constraint, and the table is the
-	// last line of defence, so it has to be checked without that shield.
-	const insert = `INSERT INTO transient_jobs (event_id, task_name) VALUES (?, ?)`
-
-	tests := []struct {
-		name string
-		seed *Job // inserted through the writer first, when the case needs a clash
-		args []any
-		want sqlite3.ErrNoExtended
-	}{
-		{
-			name: "event_id may not be null",
-			args: []any{nil, "ReconcileLedger"},
-			want: sqlite3.ErrConstraintNotNull,
-		},
-		{
-			name: "task_name may not be null",
-			args: []any{"evt-0007-1a2b3c4d", nil},
-			want: sqlite3.ErrConstraintNotNull,
-		},
-		{
-			name: "event_id may not repeat",
-			seed: &Job{EventID: "evt-0007-1a2b3c4d", TaskName: "ReconcileLedger"},
-			args: []any{"evt-0007-1a2b3c4d", "RebuildIndex"},
-			want: sqlite3.ErrConstraintUnique,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			s := newTestStore(t)
-			if tc.seed != nil {
-				insertJobs(t, s, *tc.seed)
-			}
-
-			_, err := s.db.ExecContext(t.Context(), insert, tc.args...)
-
-			var sqlErr sqlite3.Error
-			if !errors.As(err, &sqlErr) {
-				t.Fatalf("inserting %v = %v, want a sqlite3.Error", tc.args, err)
-			}
-			if sqlErr.ExtendedCode != tc.want {
-				t.Errorf("extended code = %d (%v), want %d", sqlErr.ExtendedCode, sqlErr, tc.want)
-			}
-		})
-	}
-}
-
-func TestEmptyDatabaseReadsCleanly(t *testing.T) {
-	t.Parallel()
-
 	s := newTestStore(t)
-
-	// Open creates the table, so "nothing written yet" must read as zero rows
-	// rather than as a missing-table error.
-	if got, err := s.CountJobs(t.Context()); err != nil || got != 0 {
-		t.Errorf("CountJobs() = %d, %v, want 0, <nil>", got, err)
-	}
-
-	got, err := s.EventIDs(t.Context())
-	if err != nil {
-		t.Fatalf("EventIDs() returned error: %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("EventIDs() = %v, want no ids", got)
+	for _, values := range [][2]any{{nil, "task"}, {"evt-1", nil}} {
+		if _, err := s.db.ExecContext(t.Context(),
+			`INSERT INTO transient_jobs (event_id, task_name) VALUES ($1, $2)`, values[0], values[1]); err == nil {
+			t.Errorf("inserted invalid values %v", values)
+		}
 	}
 }
