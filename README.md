@@ -1,16 +1,34 @@
 # Transient job queue processor
 
-A small event-driven worker, written to show how a Go project is laid out and
-tested. A producer synthesises 40 raw JSON messages — a coin flip between
-`SystemHeartbeat` and `TransientJob` — onto a buffered channel, one every 25 ms.
-Five worker goroutines drain that channel, read the `eventType` discriminator
-straight out of the bytes, and route each message through a registry to a
-handler: heartbeats are logged and discarded, job envelopes are bound to a
-struct and persisted to SQLite through a single batching writer. Failures are
-retried with exponential backoff and dead-lettered once the budget runs out, and
-Ctrl-C unwinds the pipeline in order. There is no HTTP server and nothing to
-configure; the interesting part is the shape of the thing and the tests around
-it.
+A small event-driven worker. A producer synthesises 40 raw JSON messages — a
+coin flip between `SystemHeartbeat` and `TransientJob` — onto a buffered
+channel, one every 25 ms. Five worker goroutines drain that channel, read the
+`eventType` discriminator straight out of the bytes, and route each message
+through a registry to a handler: heartbeats are logged and discarded, job
+envelopes are bound to a struct and persisted to SQLite through a single
+batching writer. Failures are retried with exponential backoff and
+dead-lettered once the budget runs out, and Ctrl-C unwinds the pipeline in
+order. There is no HTTP server and nothing to configure.
+
+## What this is for
+
+I work in .NET and wanted to know what Go actually asks of you: how a module is
+laid out, where the package boundaries fall, what testing looks like with no
+mocking library and no DI container, and which C# habits stop paying. Building
+something small with real edges — concurrency, a database, cancellation,
+partial failure — answered that faster than reading about it would have.
+
+The domain is therefore thin and the mechanics are not. The producer is a
+stand-in rather than a real broker, and there is nothing to configure. The
+worker pool, the retry and dead-letter policy, the batching writer, the context
+plumbing and the shutdown ordering are all real, as are the tests around them.
+
+The repository is public, so the notes throughout are written for someone with
+a .NET background reading it cold; the comparisons to xUnit, `InternalsVisibleTo`
+and `IHostApplicationLifetime` are the reference points I had at the time. They
+are a first pass at Go rather than seasoned advice. Where something was a
+judgement call I have tried to say so, including the calls I would revisit —
+those are collected under [Known compromises](#known-compromises) at the end.
 
 ## Prerequisites
 
@@ -90,6 +108,27 @@ sqlite3 -header -box demo.db \
 
 The database opens in WAL mode, so `demo.db-wal` and `demo.db-shm` appear
 alongside it. All three are gitignored; delete them any time to start fresh.
+
+## In a container
+
+```sh
+docker build -t go-demo-processor .
+docker run --rm -v "$PWD/data:/data" go-demo-processor
+sqlite3 data/demo.db "SELECT COUNT(*) FROM transient_jobs;"
+```
+
+The `Dockerfile` is two stages: `golang:1.24-alpine` with `gcc` and `musl-dev`
+added to build the binary, then `alpine:latest` to run it. Alpine at both ends
+is not incidental. cgo means the binary is dynamically linked, and building it
+against musl produces something that will not start on a glibc image — the
+usual `FROM scratch` ending is unavailable for the same reason. The result is
+about 14 MB.
+
+It runs as a non-root user with `/data` as both the working directory and a
+volume, because the database path is relative. SQLite needs write permission on
+the *directory* rather than just the file: WAL mode creates `demo.db-wal` and
+`demo.db-shm` beside it, so a container that can write the file but not its
+parent fails at the first insert.
 
 ## Layout
 
@@ -224,8 +263,12 @@ Cancellation is not poison, and the pool keeps the two apart. When Ctrl-C
 interrupts a handler mid-insert it fails with `context.Canceled`, which is not
 the message's fault: `deliver` checks `ctx.Err()` after a failed attempt and
 abandons the payload with a debug line instead of dead-lettering it. Without
-that check a clean shutdown would log up to `Workers` perfectly good messages
-as unprocessable — the loudest possible way to report that nothing went wrong.
+that check, a clean shutdown files any message caught mid-insert as
+unprocessable and logs an error for it — the loudest possible way to report
+that nothing went wrong. It needs a worker to be inside `InsertJob` at the
+moment of cancellation, so interrupting the demo often misses the window
+entirely; `test/e2e` reproduces it by cancelling under enough load to keep the
+writer busy.
 
 **Shutdown ordering.** `run` unwinds in dependency order, and the order is the
 whole trick:
@@ -372,3 +415,45 @@ That is all of it: no attribute, no interface to implement, no container
 registration, no scanning. The compiler rejects a function of the wrong shape,
 and an event type you forget to register dead-letters as an `UnknownEventError`
 rather than disappearing.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs `go build ./...`, `go vet ./...` and
+`go test ./... -race -count=1` on ubuntu-latest against Go 1.24. `go vet` is
+worth calling out: a set of correctness checks shipped with the toolchain and
+run automatically as part of `go test`, catching things like a `Printf` verb
+that does not match its argument. There is no separate linter package to
+choose, install and configure before the first useful signal.
+
+## Known compromises
+
+Things I would change, or at least argue about, on a second pass.
+
+**The batching writer is more machinery than the problem needed.** Accumulating
+64 rows or 5 ms before committing is a real optimisation, but the workers here
+produce a few dozen messages and would have been fine inserting one at a time.
+It also introduces shared fate: `writeBatch` returns one error for the whole
+transaction and every waiter in the batch receives it, so a single bad row
+fails 64 callers, all of which then retry. Correct, because the retry is
+idempotent, but the blast radius is wider than the failure.
+
+**Two identical sleep helpers.** `dispatch.sleep` and `queue.sleepCtx` are the
+same fifteen lines. Extracting them would mean a shared utility package
+imported by both, which is the seed of the `Common`/`Shared` project that
+eventually holds everything; Go's own advice is that a little copying beats a
+little dependency. I am not certain that is the right call at two copies.
+
+**The `TransientJob` wire format is written down twice** — once as a format
+string in `internal/queue`, once as struct tags on `jobs.Envelope`. Renaming a
+field in one place leaves the other compiling and wrong. A real system would
+have a schema somewhere; the e2e tests are what currently catch the mismatch.
+
+**The producer's `sleep` field exists for the tests.** Injecting a clock to
+make timing assertions cheap is a defensible seam, but it is a seam the
+production code does not otherwise need, and it is worth being honest that the
+design moved to suit the test.
+
+**Test helper conventions drifted.** `discardLogger` in three packages,
+`discardTestLogger` in a fourth; `runAsync` names two different contracts in
+two files. Harmless, and exactly the sort of thing a shared house style would
+have settled up front.

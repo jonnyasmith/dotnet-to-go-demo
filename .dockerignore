@@ -1,0 +1,15 @@
+# The build only needs the module files and the Go sources. Everything here is
+# either irrelevant to it or actively unwanted: the runtime database artefacts
+# would otherwise be copied into the builder image.
+.git
+.github
+.gitignore
+.gitattributes
+.vscode
+data
+*.db
+*.db-shm
+*.db-wal
+/processor
+*.test
+*.out
